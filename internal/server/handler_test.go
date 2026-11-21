@@ -31,6 +31,9 @@ func TestMain(m *testing.M) {
 	// 出口级退避默认 1s 起：真实等待会让传输层失败用例每次多睡 1-7 秒。
 	// 置 0 后 egressBackoff 恒 0（与 rotateBackoffBase=0 的测试口径一致）。
 	egressBackoffBase = 0
+	// 渠道级 busy 的内部短等同样置 0：用例只验"等一次后重试"，不真睡。
+	upstreamBusyWait = 0
+	upstreamBusyWaitMax = 0
 	os.Exit(m.Run())
 }
 
@@ -173,8 +176,8 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 
 // TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
 // 是渠道级容量满载（推理集群排队打满），**不是账号问题**（2026-10-15 实案：按
-// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：不轮转（只打一次上游）、
-// 直接回 503 + upstream_busy（可重试语义）、账号零惩罚（无冷却/无熔断/无连败）。
+// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：请求内只拿同一个号重试一次
+// （不跨号轮转），仍 busy 才回 503 + upstream_busy，账号零惩罚（无冷却/熔断/连败）。
 func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -193,8 +196,8 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d body=%s (want 503: channel-level busy, client should back off and retry)", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want busy1 1 次、busy2 0 次（零轮转）", calls)
+	if calls["Bearer at-busy1"] != 2 || calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy1 2 次（内部等一次后同号重试）、busy2 0 次（不跨号轮转）", calls)
 	}
 	// 账号完好：无冷却、无熔断计数、无连败降权。
 	st, _ := p.Status("busy1")

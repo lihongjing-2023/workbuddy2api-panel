@@ -99,6 +99,15 @@ func egressBackoff(streak int, base time.Duration) time.Duration {
 	return jitterDur(d)
 }
 
+// upstreamBusyWait 渠道级排队/满载（6020/6021/11134）时，请求内短暂等待的默认值。
+// 上游没给 retry_after（6021）时用这个值等一次，再拿同一个号重试一次。
+// 做成 var 是为了让测试置 0，避免用例真睡 2 秒。
+var upstreamBusyWait = 2 * time.Second
+
+// upstreamBusyWaitMax 有 retry_after 时请求内最多等这么久；更长的等待仍交给
+// 429 + Retry-After 让客户端自己睡，避免占住账号在途租约到客户端超时。
+var upstreamBusyWaitMax = 5 * time.Second
+
 // waitForSlot 在「号都在途占满」时等一个空名额：轮询 slotPoll，上限 slotWaitMax。
 // 返回 false = 客户端断连。等到名额、或池况变成别的原因（冷却/停牌/保底）都提前收手
 // ——由调用方重选一次定论。

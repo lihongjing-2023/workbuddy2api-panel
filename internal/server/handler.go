@@ -811,6 +811,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	busyWaited := false
 	// slotWaited 本次请求是否已经为「号都在途占满」等过一轮名额（issue #117）。
 	slotWaited := false
+	// queueWaited 本次请求是否已经为渠道级排队/满载（6020/6021/11134）等过一次。
+	// 每请求最多等一次，避免上游持续 busy 时无限拖住客户端。
+	queueWaited := false
+	// queueRetryUID 内部重试要拿回同一个号（保留上游前缀缓存）；选号失败则回落常规轮换。
+	queueRetryUID := ""
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1064,9 +1069,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		chatMeta.HeaderBudget = budget
 
-		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+		// 选号：busy 内部重试优先拿回原号（保留前缀缓存），其次粘性号，最后普通轮换。
 		var acct *auth.Auth
-		if stickyUID != "" {
+		if queueRetryUID != "" {
+			acct = h.cfg.Pool.PickByUIDForModel(queueRetryUID, bareModel)
+			queueRetryUID = ""
+			if acct != nil && realm != "" && acct.Realm() != realm {
+				acct = nil
+			}
+		}
+		if acct == nil && stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
@@ -1449,32 +1461,54 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
-			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
-			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
-			// （2026-10-15 实案），且换号白撞把无效请求放大 MaxRotate 倍。客户端
-			// 按 SDK 退避重试即可；等待窗口过去渠道恢复即成功。
+			// 6020/6021/11134 渠道级排队/容量满载：**不罚号、不换号**，但在请求内
+			// 短等一次再拿同一个号重试——上游自己有排队，等几秒往往就穿透了；此前
+			// 立即 503 把"等一会就好"的请求甩回客户端，DSH/Codex 这类只读固定退避
+			// 的客户端会连撞多次，观感就是"经常断"。
+			// 等待要封顶：retry_after 可能是 40s，网关不能占着在途租约睡那么久。
+			// 超过上限仍回 429 + Retry-After，让客户端睡剩下的时间。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				// 只释放租约，**不解绑会话粘性**：这是上游容量信号（6020/6021 排队、
-				// 11134 provider 过载），账号本身没有任何过错。换号会丢掉账号级
-				// prompt 前缀缓存（实测同号 97-99%、换号 0-12%），客户端按
-				// Retry-After 重试时理应回到同一个号。真换了号并成功，成功分支会用
-				// Bind 覆盖旧绑定，粘性照样跟随。
-				releaseHeld()
+				lastErr = uerr
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = "upstream capacity is full (queue.full); retry after a short wait"
 				}
-				// 6020 带 data.retry_after（实测 40s）时，上游给的是通道级排队口径：
-				// 队列按 client_user_type 全局共享，换号/立刻重试都撞同一堵墙。回
-				// 429 + Retry-After 让客户端按上游给的时长睡；没有该字段（6021 队列满）
-				// 才是「间歇空窗」，保持 503 让客户端自行短退避。
-				busyStatus := queueBusyStatus(w, string(respBody))
-				writeOpenAIErrorHint(w, busyStatus, "upstream_busy", msg,
-					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
-				st.status = busyStatus
-				st.outcome = reqlog.OutcomeHTTPError
+				writeBusy := func() {
+					busyStatus := queueBusyStatus(w, string(respBody))
+					writeOpenAIErrorHint(w, busyStatus, "upstream_busy", msg,
+						h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
+					st.status = busyStatus
+					st.outcome = reqlog.OutcomeHTTPError
+				}
+				if !queueWaited {
+					queueWaited = true
+					wait := upstreamBusyWait
+					if d, ok := upstream.QueueRetryAfter(respBody); ok && d > 0 {
+						if d > upstreamBusyWaitMax {
+							d = upstreamBusyWaitMax
+						}
+						wait = d
+					}
+					if wait > 0 {
+						log.Printf("INFO: [server] model=%s acct=%s: upstream busy, waiting %s before one retry",
+							bareModel, logfmt.Label(acct.UID, acct.Nickname), wait.Round(time.Millisecond))
+						if !sleepCtx(r.Context(), wait) {
+							writeBusy() // 客户端已断连：不再重试，按原错误回
+							return
+						}
+					}
+					// 释放租约后重新选号：queueRetryUID 让下一轮拿回同一个号，
+					// 保留上游前缀缓存；不解绑会话粘性、不换号乱撞。
+					releaseHeld()
+					delete(tried, acct.UID)
+					queueRetryUID = acct.UID
+					continue
+				}
+				// 已经等过一次仍 busy：按上游口径返回。6020 带 retry_after → 429 +
+				// Retry-After；6021 无该字段 → 503，客户端自行短退避。
+				releaseHeld()
+				writeBusy()
 				return
 			}
 			// Cloudflare 520/522/524 回源失败：**不罚号不轮转**，立即 503 + 摘要。
