@@ -811,9 +811,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	busyWaited := false
 	// slotWaited 本次请求是否已经为「号都在途占满」等过一轮名额（issue #117）。
 	slotWaited := false
-	// queueWaited 本次请求是否已经为渠道级排队/满载（6020/6021/11134）等过一次。
-	// 每请求最多等一次，避免上游持续 busy 时无限拖住客户端。
-	queueWaited := false
+	// busyRetries 本次请求已为渠道级排队/满载（6020/6021/11134）内部重试的次数。
+	// 上限 upstreamBusyMaxRetries，避免上游持续 busy 时无限拖住客户端。
+	busyRetries := 0
 	// queueRetryUID 内部重试要拿回同一个号（保留上游前缀缓存）；选号失败则回落常规轮换。
 	queueRetryUID := ""
 
@@ -1461,12 +1461,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6020/6021/11134 渠道级排队/容量满载：**不罚号、不换号**，但在请求内
-			// 短等一次再拿同一个号重试——上游自己有排队，等几秒往往就穿透了；此前
-			// 立即 503 把"等一会就好"的请求甩回客户端，DSH/Codex 这类只读固定退避
-			// 的客户端会连撞多次，观感就是"经常断"。
-			// 等待要封顶：retry_after 可能是 40s，网关不能占着在途租约睡那么久。
-			// 超过上限仍回 429 + Retry-After，让客户端睡剩下的时间。
+			// 6020/6021/11134 渠道级排队/容量满载：**不罚号、不换号**，在请求内
+			// 短等并重试同一个号（上限 upstreamBusyMaxRetries 次）——上游自己有排队，
+			// 等几秒往往就穿透了；此前立即 503 把"等一会就好"的请求甩回客户端，
+			// DSH/Codex 这类只读固定退避的客户端会连撞，观感就是"经常断"。
+			// 等待封顶：没有 retry_after 时按 2s/4s/5s 递增；有 retry_after 取
+			// min(retry_after, 5s)。重试不消耗 MaxRotate 换号次数。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				lastErr = uerr
@@ -1481,9 +1481,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.status = busyStatus
 					st.outcome = reqlog.OutcomeHTTPError
 				}
-				if !queueWaited {
-					queueWaited = true
+				if busyRetries < upstreamBusyMaxRetries {
+					busyRetries++
 					wait := upstreamBusyWait
+					for k := 1; k < busyRetries && wait < upstreamBusyWaitMax; k++ {
+						wait *= 2
+					}
+					if wait > upstreamBusyWaitMax {
+						wait = upstreamBusyWaitMax
+					}
 					if d, ok := upstream.QueueRetryAfter(respBody); ok && d > 0 {
 						if d > upstreamBusyWaitMax {
 							d = upstreamBusyWaitMax
@@ -1491,8 +1497,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						wait = d
 					}
 					if wait > 0 {
-						log.Printf("INFO: [server] model=%s acct=%s: upstream busy, waiting %s before one retry",
-							bareModel, logfmt.Label(acct.UID, acct.Nickname), wait.Round(time.Millisecond))
+						log.Printf("INFO: [server] model=%s acct=%s: upstream busy (%d/%d), waiting %s before retry",
+							bareModel, logfmt.Label(acct.UID, acct.Nickname), busyRetries,
+							upstreamBusyMaxRetries, wait.Round(time.Millisecond))
 						if !sleepCtx(r.Context(), wait) {
 							writeBusy() // 客户端已断连：不再重试，按原错误回
 							return
@@ -1503,9 +1510,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					releaseHeld()
 					delete(tried, acct.UID)
 					queueRetryUID = acct.UID
+					i-- // busy 重试不占 MaxRotate 换号次数
 					continue
 				}
-				// 已经等过一次仍 busy：按上游口径返回。6020 带 retry_after → 429 +
+				// 重试次数用尽仍 busy：按上游口径返回。6020 带 retry_after → 429 +
 				// Retry-After；6021 无该字段 → 503，客户端自行短退避。
 				releaseHeld()
 				writeBusy()

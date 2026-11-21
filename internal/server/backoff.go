@@ -108,6 +108,11 @@ var upstreamBusyWait = 2 * time.Second
 // 429 + Retry-After 让客户端自己睡，避免占住账号在途租约到客户端超时。
 var upstreamBusyWaitMax = 5 * time.Second
 
+// upstreamBusyMaxRetries 渠道级 busy 时每请求最多内部重试次数（不含首次调用）。
+// 3 次对应 2s/4s/5s 封顶等待，最坏约 11s 后仍 busy 才回 429/503；不无限重试，
+// 避免上游持续满载时把每个请求放大成几十次上游调用。
+const upstreamBusyMaxRetries = 3
+
 // waitForSlot 在「号都在途占满」时等一个空名额：轮询 slotPoll，上限 slotWaitMax。
 // 返回 false = 客户端断连。等到名额、或池况变成别的原因（冷却/停牌/保底）都提前收手
 // ——由调用方重选一次定论。

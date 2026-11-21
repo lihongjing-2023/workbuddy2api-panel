@@ -176,8 +176,9 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 
 // TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
 // 是渠道级容量满载（推理集群排队打满），**不是账号问题**（2026-10-15 实案：按
-// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：请求内只拿同一个号重试一次
-// （不跨号轮转），仍 busy 才回 503 + upstream_busy，账号零惩罚（无冷却/熔断/连败）。
+// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：请求内最多拿同一个号重试
+// upstreamBusyMaxRetries 次（不跨号轮转），仍 busy 才回 503 + upstream_busy，
+// 账号零惩罚（无冷却/熔断/连败）。
 func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -196,8 +197,10 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d body=%s (want 503: channel-level busy, client should back off and retry)", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-busy1"] != 2 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want busy1 2 次（内部等一次后同号重试）、busy2 0 次（不跨号轮转）", calls)
+	wantBusy1 := int32(1 + upstreamBusyMaxRetries)
+	if int32(calls["Bearer at-busy1"]) != wantBusy1 || calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy1 %d 次（首次 + 最多 %d 次同号重试）、busy2 0 次（不跨号轮转）",
+			calls, wantBusy1, upstreamBusyMaxRetries)
 	}
 	// 账号完好：无冷却、无熔断计数、无连败降权。
 	st, _ := p.Status("busy1")
