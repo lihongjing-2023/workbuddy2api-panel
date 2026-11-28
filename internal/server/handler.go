@@ -1699,6 +1699,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
 				upstream.WithMarkupRepair(repair),
+				upstream.WithUsageCacheHitRewrite(h.cfg.Upstream.UsageCacheHitRewriteSnapshot()),
 				// 客户端自己断开时上游只是被动跟随，别把断流记成上游故障（日志归因）：
 				// 这条 WARN 会顶掉真正的上游断流，让「错误汇总」失去信噪比。
 				upstream.WithClientGoneFn(func() bool { return r.Context().Err() != nil }))
@@ -1845,6 +1846,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 			h.noteCacheAffinity(bindKey, acct.UID, st.hasCache, st.promptTokens, st.cacheHit)
+		}
+		// 统计已按上游真值记完，再重写回客户端的 usage；Responses 兜底路径
+		// 读的也是这份 body，因此一并覆盖。
+		if u, ok := resp["usage"].(map[string]any); ok {
+			resp["usage"] = upstream.RewriteUsageCacheHit(u, h.cfg.Upstream.UsageCacheHitRewriteSnapshot(), nil)
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK

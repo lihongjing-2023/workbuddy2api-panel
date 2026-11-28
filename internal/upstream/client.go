@@ -1004,6 +1004,11 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// UsageCacheHitRewrite 回程 usage 缓存命中值的概率重写配置快照。
+	// 默认 nil（不重写）；面板保存配置走 SetUsageCacheHitRewrite 原子替换，
+	// 请求热路径只读快照，不与配置对象共享可变 slice。
+	UsageCacheHitRewrite atomic.Pointer[CacheHitRewriteConfig]
+
 	// KeepRecentRounds 只保留最近 N 轮对话（prompt.keep_recent_rounds）：
 	// 0 = 关闭（全量透传）。热生效，chat 热路径并发读，用 atomic.Int32。
 	KeepRecentRounds atomic.Int32
@@ -1097,6 +1102,32 @@ func New() *Client {
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c
+}
+
+// SetUsageCacheHitRewrite 发布一份不可变的重写配置快照；关闭时直接清空，
+// 热路径判 nil 即零成本跳过。
+func (c *Client) SetUsageCacheHitRewrite(cfg CacheHitRewriteConfig) {
+	if c == nil {
+		return
+	}
+	cfg.Normalize()
+	if !cfg.Enabled {
+		c.UsageCacheHitRewrite.Store(nil)
+		return
+	}
+	cp := cfg.Clone()
+	c.UsageCacheHitRewrite.Store(&cp)
+}
+
+// UsageCacheHitRewriteSnapshot 返回当前配置副本；nil 表示功能关闭。
+func (c *Client) UsageCacheHitRewriteSnapshot() CacheHitRewriteConfig {
+	if c == nil {
+		return CacheHitRewriteConfig{}
+	}
+	if p := c.UsageCacheHitRewrite.Load(); p != nil {
+		return p.Clone()
+	}
+	return CacheHitRewriteConfig{}
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。

@@ -1361,6 +1361,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
+            <div class="switch"><span class="lb">回程缓存命中值概率重写</span>
+              <input type="checkbox" name="usage_cache_hit_rewrite_enabled"></div>
+            <div class="hint">开启后按档位概率重写返回给客户端的 usage 缓存命中值；面板用量、请求日志仍记上游真值。保存即热生效。</div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">命中 / 概率扰动 ±%</span>
+                <input type="number" min="0" max="50" step="1" name="usage_cache_hit_rewrite_jitter" placeholder="5">
+                <span class="hint">0 = 不扰动；同时作用于每档概率与命中百分比。默认 5。</span></label>
+              <label class="fld"><span class="lb">重写档位 JSON</span>
+                <input name="usage_cache_hit_rewrite_buckets" placeholder='[{"probability":30,"hit_percent":30},{"probability":30,"hit_percent":80}]'>
+                <span class="hint">probability=进入该档概率，hit_percent=命中百分比；余量不重写。默认 30/30 + 30/80。</span></label>
+            </div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>

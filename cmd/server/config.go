@@ -14,6 +14,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -228,6 +229,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// UsageCacheHitRewrite 回程 usage 缓存命中值概率重写（默认关闭）。
+		// 只改客户端看到的 usage，内部用量桶/请求日志仍记上游真值。
+		UsageCacheHitRewrite upstream.CacheHitRewriteConfig `json:"usage_cache_hit_rewrite"`
 	} `json:"features"`
 
 	Models struct {
@@ -401,6 +405,16 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// 缓存命中重写默认关闭；开启后默认分布 30%→30%、30%→80%、40% 不重写，
+	// 概率与命中百分比各带 ±5 的整数扰动（见 upstream.CacheHitRewriteConfig）。
+	c.Features.UsageCacheHitRewrite = upstream.CacheHitRewriteConfig{
+		Enabled:       false,
+		JitterPercent: 5,
+		Buckets: []upstream.CacheHitRewriteBucket{
+			{Probability: 30, HitPercent: 30},
+			{Probability: 30, HitPercent: 80},
+		},
+	}
 	c.Prompt.Mode = "passthrough"                                 // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Prompt.IdentityOverrideText = prompt.DefaultHarnessIdentity // 老配置开关缺省 false，不改变现有行为
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
@@ -566,6 +580,16 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
+		}
+	}
+	if v := os.Getenv("WB2A_USAGE_CACHE_HIT_REWRITE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.UsageCacheHitRewrite.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_USAGE_CACHE_HIT_REWRITE_JITTER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Features.UsageCacheHitRewrite.JitterPercent = n
 		}
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
@@ -804,6 +828,8 @@ func (c *Config) normalize() error {
 	if c.Schedule.NightAccountCap < 0 {
 		return fmt.Errorf("schedule.night_account_cap: %d 非法（0 = 不限，>0 = Top-N）", c.Schedule.NightAccountCap)
 	}
+	// 缓存命中重写：百分比笔误钳到安全区间即可，不该让整个网关因一个展示参数起不来。
+	c.Features.UsageCacheHitRewrite.Normalize()
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}

@@ -1337,6 +1337,9 @@ const CFG_MAP = {
   prompt_identity_override_enabled: ['prompt', 'identity_override_enabled'],
   prompt_identity_override_text: ['prompt', 'identity_override_text'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  usage_cache_hit_rewrite_enabled: ['features', 'usage_cache_hit_rewrite', 'enabled'],
+  usage_cache_hit_rewrite_jitter: ['features', 'usage_cache_hit_rewrite', 'jitter_percent'],
+  usage_cache_hit_rewrite_buckets: ['features', 'usage_cache_hit_rewrite', 'buckets'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
   request_archive_context: ['logging', 'request_archive_context'],
@@ -1389,6 +1392,7 @@ async function loadConfig() {
       if (!el) continue;
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
+      else if (name === 'usage_cache_hit_rewrite_buckets') el.value = v == null ? '' : JSON.stringify(v);
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
@@ -1408,7 +1412,16 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (name.endsWith('_account_order') || name === 'models_hidden') v = raw.split(/[,，\s]+/).filter(Boolean);
+      if (name === 'usage_cache_hit_rewrite_buckets') {
+        if (raw === '') v = undefined;
+        else {
+          try {
+            v = JSON.parse(raw);
+            if (!Array.isArray(v)) throw new Error('必须是数组');
+          } catch (e) { toast('缓存命中档位不是合法 JSON 数组：' + e.message, 'err'); continue; }
+        }
+      }
+      else if (name.endsWith('_account_order') || name === 'models_hidden') v = raw.split(/[,，\s]+/).filter(Boolean);
       else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;

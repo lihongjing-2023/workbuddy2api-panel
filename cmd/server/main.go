@@ -187,6 +187,8 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	// 回程 usage 缓存命中概率重写：面板保存热生效，见 saveConfig。
+	up.SetUsageCacheHitRewrite(cfg.Features.UsageCacheHitRewrite)
 	// 历史裁剪轮数（prompt.keep_recent_rounds，0 = 关闭）：热生效，见 saveConfig。
 	up.KeepRecentRounds.Store(int32(cfg.Prompt.KeepRecentRounds))
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
@@ -622,6 +624,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SetUsageCacheHitRewrite(newCfg.Features.UsageCacheHitRewrite)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

@@ -491,6 +491,12 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	// cacheHitRewrite 本流回程 usage 的概率重写配置；nil = 不重写。
+	cacheHitRewrite *CacheHitRewriteConfig
+	// rewriteTargetPct 是本流唯一一次抽样得到的命中百分比，rewriteOK=false 表示
+	// 本轮不重写。流式 usage 只决定一次，避免多帧 usage 各摇一次。
+	rewriteTargetPct int
+	rewriteOK        bool
 	// clientGone 客户端是否已经断开（handler 传 r.Context().Err() != nil）。
 	// 只用于**日志归因**：客户端自己走了（pkill / 关页面 / idle 掐线），上游只是
 	// 被动跟随断连，那条「上游未给终态就结束」的 WARN 就不该记——线上实测 pkill
@@ -515,6 +521,14 @@ func WithMarkupRepair(r *MarkupRepair) StreamOption {
 	return func(o *streamOptions) { o.markup = r }
 }
 
+// WithUsageCacheHitRewrite 为回程 usage 注入缓存命中概率重写配置。
+// 传关闭配置（Enabled=false）或 nil 配置与不传该 option 等价：整条流零抽样零改写。
+// 配置会被深拷贝，调用方之后修改原对象不会影响已开始的流。
+func WithUsageCacheHitRewrite(cfg CacheHitRewriteConfig) StreamOption {
+	cp := cfg.Clone()
+	return func(o *streamOptions) { o.cacheHitRewrite = &cp }
+}
+
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
 // payload（原始 data 内容）回调一次。给调用方一个**账号处置**的挂载点——
 // 上游「200 + error 帧」是真实形态（6004 限流、内容拦截、审核），此前网关在读
@@ -534,6 +548,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if f != nil {
 			f(&o)
 		}
+	}
+	// 一次 SSE 只摇一次：usage 末帧可能重发多次，重复抽样会让同一响应自相矛盾。
+	if o.cacheHitRewrite != nil && o.cacheHitRewrite.Enabled {
+		o.rewriteTargetPct, o.rewriteOK = RollCacheHitRewrite(*o.cacheHitRewrite, nil)
 	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -635,6 +653,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 						maxToolIdx = int(v)
 					}
 				}
+			}
+		}
+		// 客户端出口：重写 usage 命中值。stats reader 在 StreamHint 上游读原始
+		// SSE，因此内部统计/命中率 WARN 看到的仍是上游真值。
+		if o.rewriteOK {
+			if u, ok := obj["usage"].(map[string]any); ok {
+				obj["usage"] = ApplyCacheHitRewrite(u, o.rewriteTargetPct)
 			}
 		}
 		raw, err := json.Marshal(normalizeFrame(obj))

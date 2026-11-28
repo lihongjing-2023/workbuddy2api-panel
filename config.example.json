@@ -84,7 +84,15 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "usage_cache_hit_rewrite": {
+      "enabled": false,
+      "jitter_percent": 5,
+      "buckets": [
+        { "probability": 30, "hit_percent": 30 },
+        { "probability": 30, "hit_percent": 80 }
+      ]
+    }
   },
   "models": {
     "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域。/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。",
