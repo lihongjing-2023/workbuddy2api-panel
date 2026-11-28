@@ -30,28 +30,29 @@ import (
 type ErrKind int
 
 const (
-	ErrNone           ErrKind = iota // 成功
-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
-	ErrTokenRejected                 // 401 无业务信封（APISIX 网关直接判 token 无效）→ 先强制 refresh 一次，失败才按 session dead 累计
-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                        // 5xx 上游故障
-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrChannelRefused                // 11-128 request illegal 通道校验失败（上游判定请求不是官方客户端发出）→ 请求级：不罚号、不轮转
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
-	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
-	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
-	ErrModelBusy                     // 14003「Model busy」模型后端间歇繁忙 → 只停(账号×模型)短窗口，不罚账号、照常换号
-	ErrGatewayDown                   // Cloudflare 520/522/524 等「边缘→源站」故障 → 零惩罚、不轮转，末端 503
-	ErrEmptyContent                  // 11151「a message has empty content」→ 请求内容级空 text 段（出站已补位，这里是兜底）：不罚号、不轮转，末端 400 透传原文
-	ErrToolMismatch                  // 11148「tool calls and tool results do not match」→ 请求内容级配对断裂（换号无效）：不罚号、不轮转，末端 400 透传原文
-	ErrModelParamInvalid             // 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、参数形态不符）→ 请求级：不罚号、不轮转，末端 400 透传原文
-	ErrClient                        // 其他 4xx / 业务错误
+	ErrNone              ErrKind = iota // 成功
+	ErrHardCredit                       // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                         // 429 软限流 → 短冷却
+	ErrSessionDead                      // 401 + 12153 offline session 失效 → 禁用
+	ErrTokenRejected                    // 401 无业务信封（APISIX 网关直接判 token 无效）→ 先强制 refresh 一次，失败才按 session dead 累计
+	ErrNotFound                         // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                           // 5xx 上游故障
+	ErrContentBlocked                   // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                        // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrAccountFault                     // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrChannelRefused                   // 11-128 request illegal 通道校验失败（上游判定请求不是官方客户端发出）→ 请求级：不罚号、不轮转
+	ErrModelBlocked                     // 11158「该账号类型无权使用该模型」→ (账号,模型) 负缓存避让，切到有权限的号
+	ErrModelMissing                     // 11102「该模型 id 上游不存在」→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrWafBlock                         // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
+	ErrPromptTooLong                    // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                     // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+	ErrUpstreamBusy                     // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrModelBusy                        // 14003「Model busy」模型后端间歇繁忙 → 只停(账号×模型)短窗口，不罚账号、照常换号
+	ErrGatewayDown                      // Cloudflare 520/522/524 等「边缘→源站」故障 → 零惩罚、不轮转，末端 503
+	ErrEmptyContent                     // 11151「a message has empty content」→ 请求内容级空 text 段（出站已补位，这里是兜底）：不罚号、不轮转，末端 400 透传原文
+	ErrToolMismatch                     // 11148「tool calls and tool results do not match」→ 请求内容级配对断裂（换号无效）：不罚号、不轮转，末端 400 透传原文
+	ErrModelParamInvalid                // 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、参数形态不符）→ 请求级：不罚号、不轮转，末端 400 透传原文
+	ErrClient                           // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -74,6 +75,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrModelMissing:
+		return "model_missing"
 	case ErrWafBlock:
 		return "waf_block"
 	case ErrPromptTooLong:
@@ -411,8 +414,30 @@ func IsModelBlocked(status int, body string) bool {
 	return strings.Contains(lowerMsg, modelBlockMsgMarker) || strings.Contains(lowerMsg, modelForbiddenMsgMarker)
 }
 
+// IsModelMissing 报告 body 是否是「这个模型 id 在上游不存在」的确定性答复（11102）。
+//
+// 与 11158「该账号类型无权使用该模型」必须分开处置：11158 换到有权限的号仍可能成功
+// （不同账号类型权限不同），11102 换遍全池都是同一句——实测把 display name
+// 「DeepSeek-V4.1-Flash」当 id 发出去，多个号一字不差全 11102；换成合法 id
+// 「deepseek-v4.1-flash」立刻 200。所以 11102 属**模型级**：
+//
+//   - 轮转只是白打号（每个号一次上游调用 + rotateBackoff 占用在途名额）；
+//   - 更坏的是每个号都会写一笔 (账号,模型) 负缓存，一次客户端写错的 id 就被写进
+//     全池避让，之后正常请求也被迫换模型；
+//   - 末端还会给出「换另一个号重试」这类反向建议（客户端照做，必然再失败一轮）。
+func IsModelMissing(status int, body string) bool {
+	if !IsModelBlocked(status, body) {
+		return false
+	}
+	code, msg := modelBlockFields(body)
+	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
+		return false
+	}
+	return true
+}
+
 // ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason。
-// 11158 是账号类型权限问题；其余已由 IsModelBlocked 确认的形态沿用 11102。
+// 11158 是账号类型权限问题；11102 已由 IsModelMissing 归到请求级，其余形态沿用 11102。
 func ModelBlockReasonFor(body string) string {
 	code, msg := modelBlockFields(body)
 	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
@@ -735,6 +760,14 @@ func errorMsg(kind ErrKind, status int, raw string) string {
 }
 
 func Classify(status int, body string) ErrKind {
+	// 11102「该模型 id 上游不存在」与 11158「该账号类型无权使用该模型」共用一份判据
+	// （IsModelBlocked），但处置必须分开：11102 是模型级（换遍全池同一句，实测多个号
+	// 一字不差），归请求级 ErrModelMissing——零动作、不轮转、不写 (账号,模型) 负缓存；
+	// 11158 是账号类型权限（换到有权限的号真能成功），继续走 ErrModelBlocked 的
+	// 负缓存 + 轮转。两者都只认 400/404（429+11102 属限流语义，落下方 status==429 层）。
+	if IsModelMissing(status, body) {
+		return ErrModelMissing
+	}
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
 	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
@@ -838,6 +871,14 @@ func Classify(status int, body string) ErrKind {
 				return ErrPromptTooLong
 			}
 		}
+	}
+	// 11103「Backend [x] is not supported」：该模型的**上游后端未启用/配置不全**（实测
+	// 25 个号轮转 25 次全是同一句，上游自带 retry_policy.retry=false）。它既不是账号
+	// 权限问题（11158），也不是模型 id 不存在（11102），而是「这个模型在本域服务不上」：
+	// 换遍全池结果一样。落 ErrClient 的代价是每个健康号白记一笔连败（5 次达阈降权出池）
+	// 并把整池轮转一遍，末端 503 no_healthy_account —— 把「换模型」报成「账号全挂了」。
+	if status == http.StatusBadRequest && hasBusinessCode(body, "11103") {
+		return ErrModelParamInvalid
 	}
 	// 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、参数形态与
 	// 该模型版本不符等）与图片无效同族：确定性请求级错误，同一 body 换任何账号都会被
@@ -1804,10 +1845,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		degradedWarnOnce("fetch-models/v3", "WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 	}
 	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		degradedWarnOnce("fetch-models/enterprise", "WARN: [upstream] fetch models: enterprise endpoint failed (degraded to v3/config, catalog served normally): %v", enterprise.err)
 	}
 	out := mergeModelInfos(v3.infos, enterprise.infos)
 	if len(out) == 0 {

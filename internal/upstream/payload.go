@@ -9,8 +9,41 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/loglv"
 	"log"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 )
+
+// reuEscape 匹配 JS 正则里的 \uXXXX / \u{XXXX} 转义：JS 合法，Go 的 RE2 没有 \u，
+// 只有 \x{...}。
+var reuEscape = regexp.MustCompile(`\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})`)
+
+// re2Pattern 把 JS 正则里的 \u 转义译成 RE2 认的 \x{...}，并验证译后能被 RE2 编译。
+//
+// 为什么必须译：REA 6.9.0 给每个本地路径字段挂 `^[^\uD800-\uDFFF]*$`（lone surrogate
+// 排除式），上游按 RE2 解析没有 \u 转义 → 400 code=11129「工具定义不合规」，**整颗
+// tools 被拒**，客户端所有工具都用不了。单层转义的（客户端写成 JSON 字符串里的
+// \ud800）经网关 JSON 往返已变成 U+FFFD、本来就能编译，不受影响；受影响的只有双层
+// 转义（客户端序列化时保留了反斜杠，Go 侧拿到字面 \uD800）。
+//
+// 不含 \u 时原样返回 true（正常 pattern 零额外开销，也不做编译验证）；译后仍编不过
+// （混了别的 RE2 不认的语法）返回 false，由调用方丢掉这条 pattern/键——丢它只是放宽
+// 一条本地校验正则，留着等于让整包工具被上游否掉。
+//
+// 已知边界：`\\uD800`（正则里表示字面反斜杠 + "uD800"）会被当成 \u 转义处理。这种写法
+// 在工具 schema 里未见实案，且译后仍能通过编译验证，故不做反向断言。
+func re2Pattern(p string) (string, bool) {
+	if !strings.Contains(p, `\u`) {
+		return p, true
+	}
+	q := reuEscape.ReplaceAllStringFunc(p, func(m string) string {
+		return `\x{` + strings.Trim(m[2:], "{}") + `}`
+	})
+	if _, err := regexp.Compile(q); err != nil {
+		return "", false
+	}
+	return q, true
+}
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
@@ -77,13 +110,16 @@ func PrepareBodyOptWithRounds(src []byte, sanitize bool, efforts map[string][]st
 	//  1. reorderEarlyToolResults 必须最前——「结果排在其调用之前」的倒置只有它能修。
 	//     倒置未修时 repack 会把那条早到的 tool 当普通消息直通（role != assistant），
 	//     cleanup 又因两侧 id 都在判「配对完整」放行，倒置就一路带上去撞 11148。
-	//  2. mergeAdjacentToolCalls 把「背靠背的两条 assistant.tool_calls」合成一条（部分
-	//     agent 客户端回放并行调用的报文形状），是 deepseek 系模型 11148 的正面修复。
-	//     放在早到结果回位之后：夹在两条 assistant 中间的倒置 tool 已被挪走，两条调用
-	//     才真的相邻，合并才有机会发生。
+	//  2. mergeAdjacentToolCalls 把「背靠背的两条 assistant」合成一条：前后两条都带
+	//     tool_calls 的形态（部分 agent 客户端回放并行调用的报文形状），以及后一条
+	//     带正文、带调用的形态（「先说一句进度，再发调用」被拆成两条），都是 deepseek
+	//     系模型 11148 的正面修复。放在早到结果回位之后：夹在两条 assistant 中间的
+	//     倒置 tool 已被挪走，两条调用才真的相邻，合并才有机会发生。
 	//  3. repackToolResultBlocks 把插在结果中间的非 tool 消息（Codex image_resize_notice）
-	//     挪到整组之后，保证同批结果在 wire 上连续。
-	//  4. cleanupOrphanToolCalls 删掉两侧缺一的孤儿，与前三步同口径。
+	//     挪到整组之后，保证同批结果在 wire 上连续；对不上本批的孤儿结果同样后移，
+	//     不遮挡它后面的本批合法结果。
+	//  4. cleanupOrphanToolCalls 删掉两侧缺一的孤儿、同一 call_id 的重复结果只留第一条，
+	//     与前三步同口径。
 	if msgs, ok := obj["messages"].([]any); ok {
 		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = mergeAdjacentToolCalls(msgs)
@@ -578,25 +614,176 @@ func normalizeToolPatterns(obj map[string]any) {
 	}
 }
 
+// schemaContainerKeys 容器级关键字：其值是「名字 → 子 schema」的 map（properties /
+// patternProperties / $defs / definitions / dependentSchemas），或「属性名列表 / 子 schema」
+// 的 dependentRequired / dependencies。容器自身的键是客户端声明的**名字**，绝不能当 schema
+// 关键字判定，递归只下探子 schema。不当容器处理时，属性名叫 type / items 的条目会被当成
+// 关键字改写（dependentRequired:{"items":["type"]} 里的 "type" 会被换成 {"type":"string"}）。
+var schemaContainerKeys = map[string]bool{
+	"properties":        true,
+	"patternProperties": true,
+	"$defs":             true,
+	"definitions":       true,
+	"dependentSchemas":  true,
+	"dependentRequired": true,
+	"dependencies":      true,
+}
+
+// schemaDataKeys 取值是**数据**而不是 schema 的关键字：default / const / enum / example(s)
+// 里的对象就是客户端声明的取值本身，里面出现 type、pattern 也只是数据。递归进这些值等于
+// 改写模型看到的默认值、常量与枚举项（default {"type":"str"} 被改成 "string"）。
+var schemaDataKeys = map[string]bool{
+	"default":  true,
+	"const":    true,
+	"enum":     true,
+	"example":  true,
+	"examples": true,
+}
+
+// 三组关键字的取值类型同样被上游按强类型反序列化校验，类型不符即 400 code=11129
+// （displayMsg「工具定义不合规」）。实测形态（每个样本只带一处缺陷）：
+//
+//	minimum:"1"                  → 400 11129   minimum:1                  → 200
+//	uniqueItems:"true"           → 400 11129   uniqueItems:true           → 200
+//	description:123              → 400 11129   description:"x"            → 200
+//	enum:"x"                     → 400 11129   enum:["x"]                 → 200
+//	additionalProperties:"false" → 400 11129   additionalProperties:false → 200
+//
+// 弱类型客户端（Python dict、PHP array、手写 JSON 模板）序列化出来就是这些形状；同一实测
+// 里联合类型 type:["string","null"]、oneOf、嵌套 $ref + $defs、items:{} 全部 200，所以
+// 这里只纠这三组与 additionalProperties / enum，不扩面。
+var schemaNumberKeys = []string{
+	"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+	"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+}
+
+var schemaBoolKeys = []string{"uniqueItems", "deprecated", "readOnly", "writeOnly"}
+
+var schemaStringKeys = []string{"description", "title", "format", "pattern"}
+
+// coerceSchemaKeywords 把三组关键字的取值纠成上游能接受的基本类型；纠不动就删键——
+// 留着一个非法值等于保证整颗工具必然 400，删掉只是丢掉一条约束或注释。
+func coerceSchemaKeywords(n map[string]any) {
+	for _, k := range schemaNumberKeys {
+		if v, ok := n[k]; ok {
+			if num, ok := schemaNumber(v); ok {
+				n[k] = num
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaBoolKeys {
+		if v, ok := n[k]; ok {
+			if b, ok := schemaBool(v); ok {
+				n[k] = b
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaStringKeys {
+		if v, ok := n[k]; ok {
+			if _, isStr := v.(string); !isStr {
+				delete(n, k)
+			}
+		}
+	}
+	// additionalProperties 既可以是布尔也可以是子 schema：只有非 map 的才纠成布尔。
+	if v, ok := n["additionalProperties"]; ok {
+		if _, isSchema := v.(map[string]any); !isSchema {
+			if b, ok := schemaBool(v); ok {
+				n["additionalProperties"] = b
+			} else {
+				delete(n, "additionalProperties")
+			}
+		}
+	}
+	// enum / examples 必须是数组；标量形态一律删（缺 enum 不影响工具可用）。
+	for _, k := range []string{"enum", "examples"} {
+		if v, ok := n[k]; ok {
+			if _, isList := v.([]any); !isList {
+				delete(n, k)
+			}
+		}
+	}
+}
+
+// schemaNumber 纠数值关键字：数字原样，纯数字字符串转数值，其余（bool / 对象 / NaN /
+// Infinity）判非法。encoding/json 解出来的数字一律 float64。
+func schemaNumber(v any) (any, bool) {
+	switch x := v.(type) {
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return nil, false
+		}
+		return x, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		return f, true
+	}
+	return nil, false
+}
+
+// schemaBool 纠布尔关键字：bool 原样，"true"/"false" 转义，其余判非法。
+func schemaBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
+}
+
 // normalizeSchemaTree 递归归一化工具参数 schema 树：
-//   - pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是正则；
-//     map 键不可原地改，命中时重建该层）；
-//   - 只有 enum、没有 type 的属性补上可无损推断的类型（见 inferEnumType）。
+//  0. 关键字取值类型纠偏（见 coerceSchemaKeywords）先行：纠不动的键已被删，后续只看合法值；
+//  1. 剔除值为 nil 的关键字（description:null 等让上游强类型反序列化直接报 11129），
+//     数据关键字（default / const / enum / example(s)）的 null 保留（const:null 有意义）；
+//  2. pattern 值与 patternProperties 键里的 `\_` → `_`、JS `\uXXXX` → RE2 `\x{...}`
+//     （patternProperties 的键也是正则；map 键不可原地改，有改动时重建该层）；
+//  3. 只有 enum、没有 type 的属性补上可无损推断的类型（见 inferEnumType）；
+//  4. 递归：容器只下探子 schema，数据关键字整体跳过，其余按 schema 处理。
 func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
-		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
-			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		coerceSchemaKeywords(n)
+		for k, v := range n {
+			if v == nil && !schemaDataKeys[k] {
+				delete(n, k)
+			}
+		}
+		if p, ok := n["pattern"].(string); ok {
+			p = strings.ReplaceAll(p, `\_`, `_`)
+			if fixed, ok := re2Pattern(p); ok {
+				n["pattern"] = fixed
+			} else {
+				delete(n, "pattern")
+			}
 		}
 		if props, ok := n["patternProperties"].(map[string]any); ok {
 			rebuilt := false
 			fixed := make(map[string]any, len(props))
 			for k, v := range props {
-				if strings.Contains(k, `\_`) {
-					k = strings.ReplaceAll(k, `\_`, `_`)
+				nk := strings.ReplaceAll(k, `\_`, `_`)
+				p, ok := re2Pattern(nk)
+				if !ok {
+					// 编不过的正则键留着等于整颗 schema 被上游否掉，丢掉这条约束。
+					rebuilt = true
+					continue
+				}
+				if p != k {
 					rebuilt = true
 				}
-				fixed[k] = v
+				fixed[p] = v
 			}
 			if rebuilt {
 				n["patternProperties"] = fixed
@@ -612,7 +799,26 @@ func normalizeSchemaTree(node any) {
 				}
 			}
 		}
-		for _, v := range n {
+		for k, v := range n {
+			if schemaDataKeys[k] {
+				continue
+			}
+			if schemaContainerKeys[k] {
+				switch c := v.(type) {
+				case map[string]any:
+					for _, sub := range c {
+						normalizeSchemaTree(sub)
+					}
+				case []any:
+					// dependentRequired 的数组值是属性名（字符串），不是 schema。
+					for _, sub := range c {
+						if _, isMap := sub.(map[string]any); isMap {
+							normalizeSchemaTree(sub)
+						}
+					}
+				}
+				continue
+			}
 			normalizeSchemaTree(v)
 		}
 	case []any:

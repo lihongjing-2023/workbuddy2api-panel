@@ -30,6 +30,12 @@ import (
 // ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
 // 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+	// 11103「Backend [x] is not supported」：该模型的上游后端没启用/配置不全，换号无用。
+	// 必须排在 isModelParamInvalid 的通用文案之前，否则客户端只看到「参数被拒」，
+	// 会去改参数而不是换模型。
+	if hasBusinessCode(msg, "11103") || codeMarker(strings.ToLower(msg), "11103") {
+		return "this model's backend is not enabled upstream (11103); switching accounts will not help — switch model"
+	}
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
 	// 的判定时才给「换模型」指向，否则退中性参数形态（可能是任意参数问题，不点名图片）。
@@ -74,8 +80,14 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrGatewayDown:
 		// 520/522/524 是网关到源站这一跳失败，换号/换 token 都不会好转。
 		return "upstream gateway error (Cloudflare 5xx): the origin behind the gateway is unreachable or returned an invalid response; this is not an account problem — retry after a short wait"
+	case ErrModelMissing:
+		// 11102：模型 id 在上游不存在（id 大小写敏感，display name 也算不存在——
+		// 实测「DeepSeek-V4.1-Flash」全池 11102，换成 id「deepseek-v4.1-flash」立刻 200）。
+		// 必须点名「换号无用」，否则客户端会按旧文案换号重试，白跑一轮。
+		return "model id does not exist upstream (ids are case-sensitive); copy the id from /v1/models — switching accounts will not help"
 	case ErrModelBlocked:
-		return "upstream has no such model on this backend; switch model or retry on another account"
+		// 11158：该账号类型无权使用该模型——换到有权限的号（或订阅档位更高的号）真能成功。
+		return "this account type is not allowed to use the model; the gateway will try accounts with permission"
 	case ErrContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
@@ -168,6 +180,8 @@ var frameRequestCodes = []struct {
 	{"11129", ErrBadParams},
 	{"11133", ErrModelParamInvalid},
 	{"11135", ErrImageInvalid},
+	// 11103 后端未启用：请求级（换号无用），与 Classify 的 400 分支同口径。
+	{"11103", ErrModelParamInvalid},
 	{"11148", ErrToolMismatch},
 	{"11151", ErrEmptyContent},
 	{"11152", ErrBadParams},
